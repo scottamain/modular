@@ -83,21 +83,42 @@ class Qwen3NextModel(AlwaysSignalBuffersMixin, Qwen3Model):
 
         self.state_dict = nn_model.state_dict()
         num_devices = len(self.devices)
+        kv_inputs = self.kv_params.get_symbolic_inputs()
+        flattened_kv = [
+            kv_type for sublist in kv_inputs for kv_type in sublist
+        ]
+        num_kv_inputs = len(flattened_kv)
+        num_linear = sum(
+            1 for t in model_config.layer_types if t == "linear_attention"
+        )
+        num_state_inputs = 2 * num_linear
 
         with Graph("qwen3_next", input_types=graph_inputs) as graph:
             tokens, input_row_offsets, return_n_logits, *variadic_args = (
                 graph.inputs
             )
             signal_buffers = [v.buffer for v in variadic_args[:num_devices]]
-            kv_cache_inputs = variadic_args[num_devices:]
+            kv_cache_inputs = variadic_args[num_devices : num_devices + num_kv_inputs]
+            state_inputs = variadic_args[num_devices + num_kv_inputs :]
             kv_collections = self._unflatten_kv_inputs(kv_cache_inputs)
 
-            outputs = nn_model(
+            conv_states = [v.tensor for v in state_inputs[:num_linear]]
+            recurrent_states = [
+                v.tensor for v in state_inputs[num_linear:num_state_inputs]
+            ]
+
+            logits_tuple, new_conv_states, new_recurrent_states = nn_model(
                 tokens.tensor,
                 kv_collections,
                 return_n_logits.tensor,
                 input_row_offsets.tensor,
                 signal_buffers,
+                conv_states=conv_states,
+                recurrent_states=recurrent_states,
             )
-            graph.output(*outputs)
+            graph.output(
+                *logits_tuple,
+                *new_conv_states,
+                *new_recurrent_states,
+            )
         return graph

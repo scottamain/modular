@@ -20,7 +20,8 @@ from __future__ import annotations
 import functools
 
 from max.dtype import DType
-from max.graph import DeviceRef, TensorValue, ops
+from max.graph import DeviceRef, TensorType, TensorValue, ops
+from max.nn.legacy.kv_cache import KVCacheParams
 from max.nn.legacy.layer import LayerList
 from max.nn.legacy.linear import Linear
 from max.nn.legacy.norm import RMSNorm
@@ -87,8 +88,10 @@ class Qwen3Next(Qwen3):
         return_n_logits,
         input_row_offsets,
         signal_buffers,
+        conv_states=None,
+        recurrent_states=None,
     ) -> tuple:
-        """Forward with hybrid layers. Creates zeros for linear state when not provided."""
+        """Forward with hybrid layers. Uses conv_states/recurrent_states when provided, else zeros."""
         h = self.embed_tokens(tokens, signal_buffers)
         if self.embedding_multiplier != 1.0:
             h = [hi * self.embedding_multiplier for hi in h]
@@ -98,16 +101,17 @@ class Qwen3Next(Qwen3):
             input_row_offsets, self.devices
         )
 
-        batch_dim = h[0].shape[0]
-        conv_shape = [batch_dim] + list(self.config.get_linear_conv_state_shape())
-        rec_shape = [batch_dim] + list(self.config.get_linear_recurrent_state_shape())
-        zero = ops.constant(0.0, self.config.dtype or DType.float32, DeviceRef.CPU())
-        device = self.devices[0]
-        zeros_conv = ops.broadcast_to(zero.to(device), conv_shape)
-        zeros_rec = ops.broadcast_to(zero.to(device), rec_shape)
         num_linear = len(self._linear_layer_indices)
-        conv_states = [zeros_conv] * num_linear
-        recurrent_states = [zeros_rec] * num_linear
+        if conv_states is None or recurrent_states is None:
+            batch_dim = h[0].shape[0]
+            conv_shape = [batch_dim] + list(self.config.get_linear_conv_state_shape())
+            rec_shape = [batch_dim] + list(self.config.get_linear_recurrent_state_shape())
+            zero = ops.constant(0.0, self.config.dtype or DType.float32, DeviceRef.CPU())
+            device = self.devices[0]
+            zeros_conv = ops.broadcast_to(zero.to(device), conv_shape)
+            zeros_rec = ops.broadcast_to(zero.to(device), rec_shape)
+            conv_states = [zeros_conv] * num_linear
+            recurrent_states = [zeros_rec] * num_linear
 
         linear_idx = 0
         for i, layer in enumerate(self.layers):
@@ -190,5 +194,36 @@ class Qwen3Next(Qwen3):
             offsets = input_row_offsets
 
         if logits is not None and offsets is not None:
-            return (last_logits, logits, offsets)
-        return (last_logits,)
+            logits_tuple = (last_logits, logits, offsets)
+        else:
+            logits_tuple = (last_logits,)
+        return (logits_tuple, conv_states, recurrent_states)
+
+    def input_types(
+        self, kv_params: KVCacheParams
+    ) -> tuple[TensorType | object, ...]:
+        """Add linear conv/recurrent state input types for graph I/O."""
+        base = super().input_types(kv_params)
+        num_linear = len(self._linear_layer_indices)
+        dtype = self.config.dtype or DType.float32
+        device = self.devices[0]
+        conv_shape = self.config.get_linear_conv_state_shape()
+        rec_shape = self.config.get_linear_recurrent_state_shape()
+        state_types = []
+        for _ in range(num_linear):
+            state_types.append(
+                TensorType(
+                    dtype,
+                    shape=["batch_size", conv_shape[0], conv_shape[1]],
+                    device=device,
+                )
+            )
+        for _ in range(num_linear):
+            state_types.append(
+                TensorType(
+                    dtype,
+                    shape=["batch_size", rec_shape[0], rec_shape[1], rec_shape[2]],
+                    device=device,
+                )
+            )
+        return base + tuple(state_types)
