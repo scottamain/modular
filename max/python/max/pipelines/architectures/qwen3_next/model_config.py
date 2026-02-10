@@ -51,6 +51,9 @@ class Qwen3NextConfig(Qwen3Config):
     # Indices of layers that use full (standard) attention; used for decoder and KV cache.
     full_attention_layer_indices: list[int] = field(default_factory=list)
 
+    # Total number of layers (full + linear). Used by hybrid decoder; num_hidden_layers stays full-attention count until then.
+    total_num_layers: int = 0
+
     @staticmethod
     def get_num_layers(huggingface_config: AutoConfig) -> int:
         """Number of decoder layers (full-attention only for current implementation)."""
@@ -110,6 +113,7 @@ class Qwen3NextConfig(Qwen3Config):
         full_attention_indices = [
             i for i, t in enumerate(layer_types) if t == "full_attention"
         ]
+        total_num_layers = len(layer_types)
 
         linear_key_head_dim = getattr(huggingface_config, "linear_key_head_dim", 128)
         linear_num_key_heads = getattr(huggingface_config, "linear_num_key_heads", 16)
@@ -194,4 +198,31 @@ class Qwen3NextConfig(Qwen3Config):
             layer_types=layer_types,
             shared_expert_intermediate_size=shared_expert_intermediate_size,
             full_attention_layer_indices=full_attention_indices,
+            total_num_layers=total_num_layers,
+        )
+
+    def get_linear_conv_state_shape(self, batch_dim: int | None = None) -> tuple[int, ...]:
+        """Shape of conv_state for one linear layer: (batch, conv_dim, conv_kernel_size-1)."""
+        conv_dim = (
+            self.linear_key_head_dim * self.linear_num_key_heads * 2
+            + self.linear_value_head_dim * self.linear_num_value_heads
+        )
+        state_len = self.linear_conv_kernel_dim - 1
+        if batch_dim is not None:
+            return (batch_dim, conv_dim, state_len)
+        return (conv_dim, state_len)
+
+    def get_linear_recurrent_state_shape(self, batch_dim: int | None = None) -> tuple[int, ...]:
+        """Shape of recurrent_state for one linear layer: (batch, num_v_heads, head_k_dim, head_v_dim)."""
+        if batch_dim is not None:
+            return (
+                batch_dim,
+                self.linear_num_value_heads,
+                self.linear_key_head_dim,
+                self.linear_value_head_dim,
+            )
+        return (
+            self.linear_num_value_heads,
+            self.linear_key_head_dim,
+            self.linear_value_head_dim,
         )
