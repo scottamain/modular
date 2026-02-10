@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from max.dtype import DType
 from max.graph import DeviceRef, TensorValue, TensorValueLike, ops
-from max.graph.weights import Weight
+from max.graph import Weight
 from max.nn.legacy.conv import Conv1D
 from max.nn.legacy.layer import Module
 from max.nn.legacy.linear import Linear

@@ -21,7 +21,6 @@ from max.graph import DeviceRef, Graph
 from max.graph.weights import Weights, WeightsAdapter
 from max.nn.legacy.kv_cache import KVCacheParams
 from max.pipelines.lib import KVCacheConfig, PipelineConfig
-from max.pipelines.lib.interfaces import AlwaysSignalBuffersMixin
 from transformers import AutoConfig
 
 from ..qwen3.model import Qwen3Model
@@ -31,7 +30,7 @@ from .qwen3_next import Qwen3Next
 logger = logging.getLogger("max.pipelines")
 
 
-class Qwen3NextModel(AlwaysSignalBuffersMixin, Qwen3Model):
+class Qwen3NextModel(Qwen3Model):
     """Qwen3-Next pipeline model: full-attention layers only, same pipeline as Qwen3."""
 
     @classmethod
