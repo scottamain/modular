@@ -17,8 +17,10 @@
 """Qwen3-Next layers: linear attention (Gated DeltaNet) and related components."""
 
 from .linear_attention import GatedDeltaNet, RMSNormGated
+from .linear_block import Qwen3NextLinearBlock
 
 __all__ = [
     "GatedDeltaNet",
+    "Qwen3NextLinearBlock",
     "RMSNormGated",
 ]
