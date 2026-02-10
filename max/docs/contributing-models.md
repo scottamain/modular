@@ -156,8 +156,38 @@ using an evaluation harness (see below for more on this), it can be handy to
 verify portions of the model against a reference implementation during
 development.
 
-To compare against a PyTorch reference, you can use the following logit
-verification workflow:
+### Register your model for verification
+
+Before running the verification commands, register your model in the
+integration test pipeline definitions:
+
+1. **Logits generation (MAX and reference):** Add an entry to
+   `max/tests/integration/tools/create_pipelines.py` in the `PIPELINE_ORACLES`
+   dict. Use the Hugging Face model path as the key and a suitable oracle (e.g.
+   `GenericOracle`) with `model_path` and `config_params`. You can also set
+   `max_length`, `max_batch_size`, and `device_encoding_map` as needed.
+
+   If your model uses **custom Hugging Face code**—i.e. its architecture or
+   config is defined in the model repository (e.g. `modeling_*.py`,
+   `configuration_*.py`) rather than in the main `transformers` library—add
+   `trust_remote_code: True` to `config_params`. You need this when: the model
+   card or README says the model requires `trust_remote_code`; or loading the
+   model without it fails with an error asking for `trust_remote_code`; or the
+   config's `architectures` field (e.g. `Qwen3NextForCausalLM`) is not a
+   built-in in `transformers`.
+
+2. **Combined verification command:** Add an entry to
+   `max/tests/integration/accuracy/verify_pipelines.py` in the `PIPELINES` dict.
+   The key is the pipeline name used with `--pipeline` (e.g.
+   `your-org/your-model-bfloat16`). Use `PipelineDef` with
+   `run=_make_pipeline_runner(pipeline="your-org/your-model", encoding="bfloat16", ...)`.
+   Set at least `cos_dist_threshold` and `kl_div_threshold`; you can tune them
+   after an initial run. Optionally set `compatible_with` and `tags` for device
+   and CI behavior.
+
+### Run the verification workflow
+
+To compare against a PyTorch reference:
 
 ```bash
 # 1. Generate logits with MAX pipeline
@@ -185,11 +215,15 @@ verification workflow:
   --kl-div-threshold 0.01 \
   /tmp/max-logits.json /tmp/torch-logits.json
 
-# Run verification pipeline directly (combines all steps)
+# Or run verification in one step (generates both, then compares)
 ./bazelw run //max/tests/integration:verify_pipelines -- \
   --pipeline Gemma-3-1B-bfloat16 \
   --devices='gpu'
 ```
+
+Use the same `--pipeline` value as the key you added to `PIPELINE_ORACLES` (e.g.
+`Qwen/Qwen3-Coder-Next` for generate_llm_logits; `Qwen/Qwen3-Coder-Next-bfloat16`
+for verify_pipelines).
 
 ## 5. Validate model accuracy
 
@@ -213,6 +247,13 @@ Start your model server in one terminal:
 ```bash
 ./bazelw run //max/python/max/entrypoints:pipelines -- serve \
   --model-path your-org/your-model-name
+```
+
+For models that use custom code (e.g. **Qwen3-Next**), add `--trust-remote-code`:
+
+```bash
+./bazelw run //max/python/max/entrypoints:pipelines -- serve \
+  --model-path Qwen/Qwen3-Coder-Next --trust-remote-code
 ```
 
 Then run the GSM8K evaluation in another terminal:
