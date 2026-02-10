@@ -10,7 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-"""Weight adapters for Qwen3-Next: map HF state dict to full-attention layers only."""
+"""Weight adapters for Qwen3-Next: map HF state dict to MAX (all layers, full + linear)."""
 
 from __future__ import annotations
 
@@ -39,21 +39,27 @@ def _full_attention_layer_indices(huggingface_config: AutoConfig) -> list[int]:
     return [i for i in range(n) if i % interval == 0]
 
 
+def _total_num_layers(huggingface_config: AutoConfig) -> int:
+    """Total number of layers (full + linear)."""
+    layer_types = getattr(huggingface_config, "layer_types", None)
+    if layer_types is not None:
+        return len(layer_types)
+    return huggingface_config.num_hidden_layers
+
+
 def convert_safetensor_state_dict(
     state_dict: dict[str, Weights],
     huggingface_config: AutoConfig,
     pipeline_config: PipelineConfig,
     **unused_kwargs,
 ) -> dict[str, WeightData]:
-    """Convert Qwen3-Next HF state dict to MAX format (full-attention layers only).
+    """Convert Qwen3-Next HF state dict to MAX format (all layers).
 
-    Copies only weights for full_attention layers; linear_attention layer
-    weights are skipped. Remaps layer indices so our layers.0, layers.1, ...
-    correspond to HF full_attention layers. Handles MoE expert stacking
-    the same way as Qwen3-MoE for layers that use MoE.
+    Uses global layer index 0..total_num_layers-1. Includes both full_attention
+    (self_attn, mlp) and linear_attention (linear_attn, mlp) weights. Handles
+    MoE expert stacking the same way as Qwen3-MoE for layers that use MoE.
     """
-    full_attention_indices = _full_attention_layer_indices(huggingface_config)
-    hf_to_our = {hf_idx: our_idx for our_idx, hf_idx in enumerate(full_attention_indices)}
+    total = _total_num_layers(huggingface_config)
 
     # Pattern for expert weights (same as Qwen3-MoE)
     expert_pattern = re.compile(
@@ -72,27 +78,25 @@ def convert_safetensor_state_dict(
             else safetensor_name
         )
 
-        # Layer key: layers.{hf_idx}.xxx
+        # Layer key: layers.{hf_idx}.xxx — use global layer index (0..total-1)
         layer_match = re.match(r"layers\.(\d+)\.", rest)
         if layer_match:
             hf_idx = int(layer_match.group(1))
-            if hf_idx not in hf_to_our:
-                continue  # Skip linear_attention layers
-            our_idx = hf_to_our[hf_idx]
-            max_name = "layers." + str(our_idx) + "." + rest[len(layer_match.group(0)) :]
+            if hf_idx >= total:
+                continue
+            max_name = "layers." + str(hf_idx) + "." + rest[len(layer_match.group(0)) :]
         else:
             max_name = rest
 
-        # Expert weights: collect for stacking later (skip adding here)
+        # Expert weights: collect for stacking later (skip adding here), keyed by global layer index
         expert_match = expert_pattern.match(safetensor_name)
         if expert_match:
             layer_idx = int(expert_match.group(1))
-            if layer_idx not in hf_to_our:
+            if layer_idx >= total:
                 continue
-            our_layer_idx = hf_to_our[layer_idx]
             expert_idx = int(expert_match.group(2))
             proj_type = expert_match.group(3)
-            expert_weights[our_layer_idx][expert_idx][proj_type] = value.data()
+            expert_weights[layer_idx][expert_idx][proj_type] = value.data()
             continue
 
         # Apply Qwen3 MoE name mapping for mlp (e.g. gate -> gate.gate_score)
@@ -103,9 +107,9 @@ def convert_safetensor_state_dict(
 
         new_state_dict[max_name] = value.data()
 
-    # Stack expert weights for each (our) layer that has MoE (same as Qwen3)
-    for our_idx in sorted(expert_weights.keys()):
-        experts = expert_weights[our_idx]
+    # Stack expert weights for each layer that has MoE (same as Qwen3), keyed by global layer index
+    for layer_idx in sorted(expert_weights.keys()):
+        experts = expert_weights[layer_idx]
         num_experts = len(experts)
         gate_projs = []
         up_projs = []
@@ -125,7 +129,7 @@ def convert_safetensor_state_dict(
         stacked_up = np.transpose(stacked_up, (0, 2, 1))
         gate_up_proj = np.concatenate([stacked_gate, stacked_up], axis=2)
         gate_up_proj = np.ascontiguousarray(gate_up_proj)
-        gate_up_name = f"layers.{our_idx}.mlp.experts.gate_up_proj"
+        gate_up_name = f"layers.{layer_idx}.mlp.experts.gate_up_proj"
         new_state_dict[gate_up_name] = _numpy_to_weight_data(
             gate_up_proj, gate_up_name, original_dtype
         )
@@ -133,7 +137,7 @@ def convert_safetensor_state_dict(
         stacked_down = np.stack(down_projs, axis=0)
         stacked_down = np.transpose(stacked_down, (0, 2, 1))
         stacked_down = np.ascontiguousarray(stacked_down)
-        down_name = f"layers.{our_idx}.mlp.experts.down_proj"
+        down_name = f"layers.{layer_idx}.mlp.experts.down_proj"
         new_state_dict[down_name] = _numpy_to_weight_data(
             stacked_down, down_name, original_dtype
         )
