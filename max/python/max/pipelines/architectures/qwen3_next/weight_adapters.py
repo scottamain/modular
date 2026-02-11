@@ -60,6 +60,9 @@ def convert_safetensor_state_dict(
     MoE expert stacking the same way as Qwen3-MoE for layers that use MoE.
     """
     total = _total_num_layers(huggingface_config)
+    full_attn_indices = set(_full_attention_layer_indices(huggingface_config))
+    num_attn_heads = huggingface_config.num_attention_heads
+    head_dim = getattr(huggingface_config, "head_dim", 256)
 
     # Pattern for expert weights (same as Qwen3-MoE)
     expert_pattern = re.compile(
@@ -105,7 +108,50 @@ def convert_safetensor_state_dict(
                 max_name = max_name.replace(before, after)
                 break
 
-        new_state_dict[max_name] = value.data()
+        # Rename HF `shared_expert.` (singular) to MAX `shared_experts.`
+        # (plural), matching the MoE base class attribute name.
+        # NOTE: `shared_expert_gate` must NOT be renamed (no trailing dot).
+        max_name = max_name.replace(
+            ".shared_expert.", ".shared_experts."
+        )
+
+        weight_data = value.data()
+
+        # Gated Attention: split q_proj into query and gate for full-attn layers.
+        # HF stores [num_heads * head_dim * 2, hidden] with per-head interleaving
+        # (query[head_dim] then gate[head_dim] for each head).
+        # We deinterleave into:
+        #   self_attn.q_proj.weight  [num_heads * head_dim, hidden]  (query)
+        #   self_attn.attn_gate.weight  [num_heads * head_dim, hidden]  (gate)
+        layer_match_for_qproj = re.match(
+            r"layers\.(\d+)\.self_attn\.q_proj\.weight", max_name
+        )
+        if layer_match_for_qproj:
+            lidx = int(layer_match_for_qproj.group(1))
+            if lidx in full_attn_indices:
+                arr = _weight_data_to_numpy(weight_data)
+                original_dtype = weight_data.dtype
+                rows_per_head = head_dim * 2
+                # Reshape → [num_heads, rows_per_head, cols]
+                arr_3d = arr.reshape(num_attn_heads, rows_per_head, -1)
+                half = rows_per_head // 2
+                q_arr = np.ascontiguousarray(
+                    arr_3d[:, :half, :].reshape(-1, arr.shape[-1])
+                )
+                g_arr = np.ascontiguousarray(
+                    arr_3d[:, half:, :].reshape(-1, arr.shape[-1])
+                )
+                q_name = max_name
+                g_name = max_name.replace("q_proj", "attn_gate")
+                new_state_dict[q_name] = _numpy_to_weight_data(
+                    q_arr, q_name, original_dtype
+                )
+                new_state_dict[g_name] = _numpy_to_weight_data(
+                    g_arr, g_name, original_dtype
+                )
+                continue
+
+        new_state_dict[max_name] = weight_data
 
     # Stack expert weights for each layer that has MoE (same as Qwen3), keyed by global layer index
     for layer_idx in sorted(expert_weights.keys()):

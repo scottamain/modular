@@ -282,6 +282,8 @@ class Qwen3VLMoE(MoE):
         dtype: DType = DType.bfloat16,
         mlp_only_layers: list[int] | None = None,
         float8_config: Float8Config | None = None,
+        has_shared_experts: bool = False,
+        shared_experts_dim: int = 0,
         is_sharding: bool = False,
     ) -> None:
         """
@@ -294,6 +296,8 @@ class Qwen3VLMoE(MoE):
             dtype: The data type of the MoE.
             mlp_only_layers: List of layer indices that use MLP instead of MoE (unused here, kept for compatibility).
             float8_config: Configuration for FP8 quantization.
+            has_shared_experts: Whether to use shared experts (e.g. Qwen3-Next).
+            shared_experts_dim: The intermediate dimension of the shared experts.
             is_sharding: Whether the module is being sharded.
         """
         super().__init__(
@@ -304,8 +308,8 @@ class Qwen3VLMoE(MoE):
             moe_dim=moe_dim,
             gate_cls=gate_cls,
             dtype=dtype,
-            has_shared_experts=False,
-            shared_experts_dim=0,
+            has_shared_experts=has_shared_experts,
+            shared_experts_dim=shared_experts_dim,
             ep_size=1,
             apply_router_weight_first=False,
             ep_batch_manager=None,
@@ -313,6 +317,18 @@ class Qwen3VLMoE(MoE):
             is_sharding=is_sharding,
         )
         self.mlp_only_layers = mlp_only_layers
+
+        # Learned gate for shared expert (e.g. Qwen3-Next).
+        # When present, the shared expert output is scaled by
+        # sigmoid(shared_expert_gate(x)) before being added to the
+        # routed expert output.
+        if has_shared_experts and not is_sharding:
+            self.shared_expert_gate = Weight(
+                name="shared_expert_gate.weight",
+                dtype=DType.bfloat16,
+                shape=(1, hidden_dim),
+                device=devices[0],
+            )
 
     def _init_experts(self) -> None:
         """Initialize experts using stacked weight tensors instead of individual MLPs.
@@ -454,6 +470,11 @@ class Qwen3VLMoE(MoE):
                         num_devices=strategy.num_devices,
                         shard=down_proj_scale_shard_fn,
                     )
+                )
+            if self.has_shared_experts:
+                self.shared_experts.sharding_strategy = strategy
+                self.shared_expert_gate.sharding_strategy = (
+                    ShardingStrategy.replicate(strategy.num_devices)
                 )
         else:
             raise ValueError(
@@ -600,6 +621,20 @@ class Qwen3VLMoE(MoE):
         routed_expert_out = ops.unsqueeze(router_weight, axis=1) @ down_projs
         routed_expert_out = ops.squeeze(routed_expert_out, axis=1).cast(x.dtype)
 
+        # Add shared expert contribution (if enabled).
+        if self.has_shared_experts:
+            shared_out = self.shared_experts(x)
+            if isinstance(shared_out, list):
+                shared_out = shared_out[0]
+            # Apply learned gate: sigmoid(x @ gate^T) * shared_expert(x)
+            gate_w = self.shared_expert_gate.cast(x.dtype).to(x.device)
+            gate_val = ops.sigmoid(
+                (x.cast(DType.float32) @ gate_w.cast(DType.float32).transpose(0, 1))
+            )
+            routed_expert_out = routed_expert_out + (
+                gate_val.cast(x.dtype) * shared_out
+            )
+
         return routed_expert_out
 
     def shard(self, devices: Iterable[DeviceRef]) -> list[Qwen3VLMoE]:
@@ -617,6 +652,10 @@ class Qwen3VLMoE(MoE):
 
         # Get sharded weights
         gate_shards = self.gate.shard(devices)
+
+        if self.has_shared_experts:
+            shared_expert_shards = self.shared_experts.shard(devices)
+            shared_gate_shards = self.shared_expert_gate.shard(devices)
 
         # Shard the stacked expert weight tensors
         experts_gate_up_proj_shards = self._experts_gate_up_proj_weight.shard(
@@ -646,6 +685,8 @@ class Qwen3VLMoE(MoE):
                 dtype=self.dtype,
                 mlp_only_layers=self.mlp_only_layers,
                 float8_config=self.float8_config,
+                has_shared_experts=self.has_shared_experts,
+                shared_experts_dim=self.shared_experts_dim,
                 is_sharding=True,
             )
             # Replace layers and weights with sharded versions.
@@ -666,6 +707,10 @@ class Qwen3VLMoE(MoE):
                 sharded._experts_down_proj_weight_scale = (
                     experts_down_proj_scale_shards[shard_idx]
                 )
+
+            if self.has_shared_experts:
+                sharded.shared_experts = shared_expert_shards[shard_idx]
+                sharded.shared_expert_gate = shared_gate_shards[shard_idx]
 
             shards.append(sharded)
 

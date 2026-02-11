@@ -61,16 +61,48 @@ class Qwen3NextLinearBlock(Module):
         layer_idx: int,
         linear_cls: Callable[..., Linear],
     ) -> MLP:
-        """MLP only (no MoE for linear blocks in this implementation)."""
-        return MLP(
-            config.dtype,
-            config.model_quantization_encoding,
-            config.hidden_size,
-            config.intermediate_size,
-            config.devices,
-            linear_cls,
-            float8_config=config.float8_config,
+        """Get MLP or MoE layer based on config and layer index.
+
+        Uses the same MoE-vs-dense logic as Qwen3TransformerBlock so that
+        linear-attention layers with MoE (the common case for Qwen3-Next)
+        load the stacked expert weights produced by the weight adapter.
+        """
+        use_moe = (
+            config.num_experts > 0
+            and layer_idx not in config.mlp_only_layers
+            and (layer_idx + 1) % config.decoder_sparse_step == 0
         )
+
+        if use_moe:
+            from max.pipelines.architectures.qwen3vl_moe.nn.moe import (
+                Qwen3VLMoE,
+            )
+
+            shared_dim = getattr(
+                config, "shared_expert_intermediate_size", 0
+            )
+            return Qwen3VLMoE(
+                devices=config.devices,
+                hidden_dim=config.hidden_size,
+                num_experts=config.num_experts,
+                num_experts_per_token=config.num_experts_per_tok,
+                moe_dim=config.moe_intermediate_size,
+                dtype=config.dtype,
+                mlp_only_layers=config.mlp_only_layers,
+                float8_config=config.float8_config,
+                has_shared_experts=shared_dim > 0,
+                shared_experts_dim=shared_dim,
+            )
+        else:
+            return MLP(
+                config.dtype,
+                config.model_quantization_encoding,
+                config.hidden_size,
+                config.intermediate_size,
+                config.devices,
+                linear_cls,
+                float8_config=config.float8_config,
+            )
 
     def __call__(
         self,

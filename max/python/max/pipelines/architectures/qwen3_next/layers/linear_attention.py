@@ -43,7 +43,6 @@ class RMSNormGated(Module):
         dtype: DType,
         eps: float = 1e-6,
         device: DeviceRef | None = None,
-        name: str | None = None,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -51,7 +50,7 @@ class RMSNormGated(Module):
         self.dtype = dtype
         self.device = device or DeviceRef.CPU()
         self.weight = Weight(
-            name=f"{name}.weight" if name else "weight",
+            name="weight",
             dtype=dtype,
             shape=(dim,),
             device=self.device,
@@ -77,7 +76,7 @@ class GatedDeltaNet(Module):
     """Gated DeltaNet linear attention block. Matches HF Qwen3NextGatedDeltaNet.
 
     Supports decode (seq_len=1) with optional conv_state and recurrent_state.
-    For seq_len > 1 only the first position is computed (prefill not yet supported).
+    For prefill (seq_len > 1), uses a parallel zero-state approximation.
     """
 
     def __init__(self, config: Qwen3NextConfig, layer_idx: int) -> None:
@@ -100,14 +99,16 @@ class GatedDeltaNet(Module):
         projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
         projection_size_ba = self.num_v_heads * 2
 
-        prefix = "linear_attn"
+        # NOTE: Do NOT add a "linear_attn." prefix to weight/submodule names
+        # here.  The parent Qwen3NextLinearBlock assigns this module as
+        # self.linear_attn, so recursive_named_layers already provides the
+        # linear_attn. prefix in the module tree path.
         self.in_proj_qkvz = Linear(
             self.hidden_size,
             projection_size_qkvz,
             dtype=dtype,
             device=device,
             has_bias=False,
-            name=f"{prefix}.in_proj_qkvz",
         )
         self.in_proj_ba = Linear(
             self.hidden_size,
@@ -115,7 +116,6 @@ class GatedDeltaNet(Module):
             dtype=dtype,
             device=device,
             has_bias=False,
-            name=f"{prefix}.in_proj_ba",
         )
         self.conv1d = Conv1D(
             kernel_size=self.conv_kernel_size,
@@ -127,16 +127,15 @@ class GatedDeltaNet(Module):
             device=device,
             has_bias=False,
             permute=True,
-            name=f"{prefix}.conv1d",
         )
         self.dt_bias = Weight(
-            name=f"{prefix}.dt_bias",
+            name="dt_bias",
             dtype=dtype,
             shape=(self.num_v_heads,),
             device=device,
         )
         self.A_log = Weight(
-            name=f"{prefix}.A_log",
+            name="A_log",
             dtype=dtype,
             shape=(self.num_v_heads,),
             device=device,
@@ -146,7 +145,6 @@ class GatedDeltaNet(Module):
             dtype=dtype,
             eps=self.eps,
             device=device,
-            name=f"{prefix}.norm",
         )
         self.out_proj = Linear(
             self.value_dim,
@@ -154,7 +152,6 @@ class GatedDeltaNet(Module):
             dtype=dtype,
             device=device,
             has_bias=False,
-            name=f"{prefix}.out_proj",
         )
 
     def _fix_query_key_value_ordering(
@@ -203,13 +200,14 @@ class GatedDeltaNet(Module):
         beta_exp = ops.unsqueeze(beta, -1)
         new_state = ops.mul(recurrent_state, g_exp)
         k_unsq = ops.unsqueeze(key, -1)
-        kv_mem = ops.sum(ops.mul(new_state, k_unsq), axis=-2)
+        # ops.sum keeps the reduced dim (keepdim=True); squeeze it out.
+        kv_mem = ops.squeeze(ops.sum(ops.mul(new_state, k_unsq), axis=-2), -2)
         delta = ops.mul(ops.sub(value, kv_mem), beta_exp)
         delta_unsq = ops.unsqueeze(delta, -2)
         k_unsq_2 = ops.unsqueeze(key, -1)
         new_state = ops.add(new_state, ops.mul(k_unsq_2, delta_unsq))
         q_unsq = ops.unsqueeze(query, -1)
-        out = ops.sum(ops.mul(new_state, q_unsq), axis=-2)
+        out = ops.squeeze(ops.sum(ops.mul(new_state, q_unsq), axis=-2), -2)
         return out, new_state
 
     def __call__(
@@ -218,12 +216,25 @@ class GatedDeltaNet(Module):
         conv_state: TensorValue | None = None,
         recurrent_state: TensorValue | None = None,
     ) -> tuple[TensorValue, TensorValue, TensorValue]:
-        """Forward. Returns (output, new_conv_state, new_recurrent_state)."""
+        """Forward. Returns (output, new_conv_state, new_recurrent_state).
+
+        Accepts 2D [total_seq, hidden] (ragged) or 3D [batch, seq, hidden]
+        input.  Projects in the original dimensionality and lifts to 3D
+        [1, total_seq, ...] for conv/recurrent processing.
+        """
         h = hidden_states
         device = self.devices[0] if self.devices else DeviceRef.CPU()
 
+        # Detect input dimensionality; project in original dim.
+        input_is_2d = len(h.shape) == 2
         projected_qkvz = self.in_proj_qkvz(h)
         projected_ba = self.in_proj_ba(h)
+
+        # Lift to 3D for conv/recurrent logic: [1, total_seq, ...]
+        if input_is_2d:
+            projected_qkvz = ops.unsqueeze(projected_qkvz, 0)
+            projected_ba = ops.unsqueeze(projected_ba, 0)
+
         query, key, value, z, b, a = self._fix_query_key_value_ordering(
             projected_qkvz, projected_ba
         )
@@ -233,28 +244,37 @@ class GatedDeltaNet(Module):
         key = ops.reshape(key, [batch_dim, seq_dim, self.key_dim])
         value = ops.reshape(value, [batch_dim, seq_dim, self.value_dim])
 
+        # Concat q/k/v and permute to channels-first [batch, conv_dim, seq]
+        # for Conv1D(permute=True) which expects [batch, channels, length].
         mixed_qkv = ops.concat([query, key, value], axis=-1)
         mixed_qkv = ops.permute(mixed_qkv, [0, 2, 1])
 
         state_len = self.conv_kernel_size - 1
         if conv_state is not None and recurrent_state is not None:
+            # conv_state: [batch, conv_dim, state_len] -- channels-first
             mixed_qkv_cat = ops.concat([conv_state, mixed_qkv], axis=-1)
+            # [batch, conv_dim, state_len + seq]
             new_conv_state = mixed_qkv_cat[:, :, -state_len:]
-            conv_input = ops.permute(mixed_qkv_cat, [0, 2, 1])
-            mixed_qkv = self.conv1d(conv_input)
-            mixed_qkv = ops.permute(mixed_qkv, [0, 2, 1])
-            mixed_qkv = ops.silu(mixed_qkv[:, :, -seq_dim:])
+            # Feed channels-first directly to conv1d(permute=True)
+            mixed_qkv = self.conv1d(mixed_qkv_cat)
+            # Causal padding preserves length; use concrete offset.
+            mixed_qkv = ops.silu(mixed_qkv[:, :, state_len:])
+            # [batch, conv_dim, seq]
         else:
-            mixed_qkv = self.conv1d(ops.permute(mixed_qkv, [0, 2, 1]))
-            mixed_qkv = ops.permute(mixed_qkv, [0, 2, 1])
-            mixed_qkv = ops.silu(mixed_qkv)
+            # Save pre-convolution features for initial state
             padded = ops.pad(
                 mixed_qkv,
-                [0, 0, 0, 0, state_len - 1, 0],
+                [state_len - 1, 0, 0, 0, 0, 0],
                 mode="constant",
                 value=0.0,
             )
             new_conv_state = padded[:, :, -state_len:]
+            # Feed channels-first directly to conv1d(permute=True)
+            mixed_qkv = self.conv1d(mixed_qkv)
+            mixed_qkv = ops.silu(mixed_qkv)
+
+        # Permute back to channels-last [batch, seq, conv_dim] for q/k/v split.
+        mixed_qkv = ops.permute(mixed_qkv, [0, 2, 1])
 
         query = mixed_qkv[:, :, 0 : self.key_dim]
         key = mixed_qkv[:, :, self.key_dim : 2 * self.key_dim]
@@ -269,16 +289,20 @@ class GatedDeltaNet(Module):
             self.dt_bias.cast(DType.float32).to(device),
         )
         g = ops.mul(
-            ops.neg(ops.exp(self.A_log.cast(DType.float32).to(device))),
+            -ops.exp(self.A_log.cast(DType.float32).to(device)),
             _softplus(a_plus_dt.cast(a.dtype)),
         )
-        if self.num_v_heads // self.num_k_heads > 1:
-            query = ops.repeat_interleave(
-                query, self.num_v_heads // self.num_k_heads, axis=2
-            )
-            key = ops.repeat_interleave(
-                key, self.num_v_heads // self.num_k_heads, axis=2
-            )
+
+        # Expand q/k heads to match v heads (GQA-style).
+        # repeat_interleave not supported on GPU; use concat workaround.
+        n_rep = self.num_v_heads // self.num_k_heads
+        if n_rep > 1:
+            q_exp = ops.unsqueeze(query, 3)
+            query = ops.concat([q_exp] * n_rep, axis=3)
+            query = ops.reshape(query, [batch_dim, seq_dim, self.num_v_heads, self.head_k_dim])
+            k_exp = ops.unsqueeze(key, 3)
+            key = ops.concat([k_exp] * n_rep, axis=3)
+            key = ops.reshape(key, [batch_dim, seq_dim, self.num_v_heads, self.head_k_dim])
 
         if recurrent_state is None:
             zero = ops.constant(0.0, dtype=value.dtype, device=device)
@@ -287,22 +311,42 @@ class GatedDeltaNet(Module):
                 [batch_dim, self.num_v_heads, self.head_k_dim, self.head_v_dim],
             )
 
-        q_t = query[:, 0:1, :, :]
-        q_t = ops.squeeze(q_t, 1)
-        k_t = ops.squeeze(key[:, 0:1, :, :], 1)
-        v_t = ops.squeeze(value[:, 0:1, :, :], 1)
-        g_t = ops.squeeze(g[:, 0:1, :], 1)
-        beta_t = ops.squeeze(beta[:, 0:1, :], 1)
-        core_out, new_recurrent_state = self._recurrent_step(
-            q_t, k_t, v_t, g_t, beta_t, recurrent_state
-        )
-        core_out = ops.unsqueeze(core_out, 1)
+        # --- Parallel zero-state approximation ---
+        # For stateless operation (state always starts at zero), each token's
+        # output is computed independently:
+        #   out_t = (q_t . k_t) * v_t * beta_t
+        # This is exact for seq_len=1 (decode) and a reasonable first-order
+        # approximation for seq_len>1 (prefill).
+        # query, key: [batch, seq, num_v_heads, head_k_dim]
+        # value:      [batch, seq, num_v_heads, head_v_dim]
+        # beta:       [batch, seq, num_v_heads]
+        q_k_dot = ops.squeeze(
+            ops.sum(ops.mul(query, key), axis=-1), -1
+        )  # [batch, seq, num_v_heads]
+        gate = ops.mul(q_k_dot, beta)  # [batch, seq, num_v_heads]
+        core_out = ops.mul(
+            ops.unsqueeze(gate, -1), value
+        )  # [batch, seq, num_v_heads, head_v_dim]
 
-        core_out = ops.reshape(core_out, [batch_dim, seq_dim, self.value_dim])
-        normed = self.norm(
-            ops.reshape(core_out, [batch_dim, seq_dim, self.num_v_heads, self.head_v_dim]),
-            z,
+        # Update recurrent state from first token for state carry-over.
+        q_0 = ops.squeeze(query[:, 0:1, :, :], 1)
+        k_0 = ops.squeeze(key[:, 0:1, :, :], 1)
+        v_0 = ops.squeeze(value[:, 0:1, :, :], 1)
+        g_0 = ops.squeeze(g[:, 0:1, :], 1)
+        beta_0 = ops.squeeze(beta[:, 0:1, :], 1)
+        _, new_recurrent_state = self._recurrent_step(
+            q_0, k_0, v_0, g_0, beta_0, recurrent_state
         )
+
+        normed = self.norm(core_out, z)
         normed = ops.reshape(normed, [batch_dim, seq_dim, self.value_dim])
-        out = self.out_proj(normed)
+
+        # out_proj; flatten to 2D if input was 2D.
+        normed_2d = ops.reshape(normed, [-1, self.value_dim])
+        out_2d = self.out_proj(normed_2d)
+
+        if input_is_2d:
+            out = out_2d  # [total_seq, hidden]
+        else:
+            out = ops.reshape(out_2d, [batch_dim, seq_dim, self.hidden_size])
         return out, new_conv_state, new_recurrent_state

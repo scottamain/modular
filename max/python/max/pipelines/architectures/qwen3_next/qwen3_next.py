@@ -28,12 +28,17 @@ from max.nn.legacy.norm import RMSNorm
 
 from max.nn.legacy.transformer import ReturnLogits
 
+from max.graph import ShardingStrategy
+
 from max.pipelines.architectures.qwen3.qwen3 import (
     Qwen3,
     distribute_value,
     forward_sharded_layers,
 )
 from max.pipelines.architectures.qwen3_next.model_config import Qwen3NextConfig
+from max.pipelines.architectures.qwen3_next.layers.gated_attention import (
+    Qwen3NextGatedAttention,
+)
 from max.pipelines.architectures.qwen3_next.layers.linear_block import (
     Qwen3NextLinearBlock,
 )
@@ -61,6 +66,32 @@ class Qwen3Next(Qwen3):
         linear_cls = functools.partial(
             Linear, float8_config=config.float8_config
         )
+
+        # Upgrade full-attention blocks from Qwen3Attention to
+        # Qwen3NextGatedAttention (query-dependent sigmoid gate).
+        num_devices = len(config.devices)
+        for block in self.layers:
+            gated_attn = Qwen3NextGatedAttention(
+                num_attention_heads=config.num_attention_heads,
+                num_key_value_heads=config.num_key_value_heads,
+                hidden_size=config.hidden_size,
+                kv_params=config.kv_params,
+                layer_idx=block.self_attn.layer_idx,
+                dtype=config.dtype,
+                rope=self.rope,
+                linear_cls=linear_cls,
+                devices=config.devices,
+                scale=config.attention_multiplier,
+                has_bias=config.attention_bias,
+            )
+            gated_attn.sharding_strategy = ShardingStrategy.tensor_parallel(
+                num_devices
+            )
+            # Copy existing projection weights (q/k/v/o) from the original
+            # attention -- they share the same names so load_state_dict will
+            # fill them in.  Replace the block's attention with the gated one.
+            block.self_attn = gated_attn
+            block.self_attn_shards = gated_attn.shard(config.devices)
 
         new_layers = []
         kv_idx = 0
@@ -103,7 +134,9 @@ class Qwen3Next(Qwen3):
 
         num_linear = len(self._linear_layer_indices)
         if conv_states is None or recurrent_states is None:
-            batch_dim = h[0].shape[0]
+            # GatedDeltaNet internally lifts ragged 2D input to [1, total_seq, hidden],
+            # so conv/recurrent states must have batch_dim=1.
+            batch_dim = 1
             conv_shape = [batch_dim] + list(self.config.get_linear_conv_state_shape())
             rec_shape = [batch_dim] + list(self.config.get_linear_recurrent_state_shape())
             zero = ops.constant(0.0, self.config.dtype or DType.float32, DeviceRef.CPU())

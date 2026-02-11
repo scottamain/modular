@@ -138,6 +138,9 @@ class Qwen3TransformerBlock(Module):
                 Qwen3VLMoE,
             )
 
+            shared_dim = getattr(
+                config, "shared_expert_intermediate_size", 0
+            )
             return Qwen3VLMoE(
                 devices=config.devices,
                 hidden_dim=config.hidden_size,
@@ -147,6 +150,8 @@ class Qwen3TransformerBlock(Module):
                 dtype=config.dtype,
                 mlp_only_layers=config.mlp_only_layers,
                 float8_config=config.float8_config,
+                has_shared_experts=shared_dim > 0,
+                shared_experts_dim=shared_dim,
             )
         else:
             return MLP(
