@@ -20,7 +20,7 @@ from __future__ import annotations
 import functools
 
 from max.dtype import DType
-from max.graph import DeviceRef, TensorType, TensorValue, ops
+from max.graph import BufferType, DeviceRef, TensorType, TensorValue, ops
 from max.nn.legacy.kv_cache import KVCacheParams
 from max.nn.legacy.layer import LayerList
 from max.nn.legacy.linear import Linear
@@ -30,6 +30,7 @@ from max.nn.legacy.transformer import ReturnLogits
 
 from max.graph import ShardingStrategy
 
+from max.nn.legacy.rotary_embedding import Llama3RotaryEmbedding
 from max.pipelines.architectures.qwen3.qwen3 import (
     Qwen3,
     distribute_value,
@@ -55,6 +56,20 @@ class Qwen3Next(Qwen3):
         if not isinstance(config, Qwen3NextConfig):
             raise TypeError("Qwen3Next requires Qwen3NextConfig")
         super().__init__(config)
+
+        # Override RoPE when partial_rotary_factor < 1.0: only rotate a
+        # fraction of head_dim, matching the HF Qwen3-Next implementation.
+        if config.partial_rotary_factor < 1.0:
+            rope_dim = int(config.kv_params.head_dim * config.partial_rotary_factor)
+            self.rope = Llama3RotaryEmbedding(
+                dim=config.hidden_size,
+                n_heads=config.num_attention_heads,
+                theta=config.rope_theta,
+                max_seq_len=config.max_seq_len,
+                head_dim=rope_dim,
+                interleaved=config.interleaved_rope_weights,
+                scaling_params=config.rope_scaling_params,
+            )
 
         create_norm = functools.partial(
             RMSNorm,
@@ -133,6 +148,7 @@ class Qwen3Next(Qwen3):
         )
 
         num_linear = len(self._linear_layer_indices)
+        assert isinstance(self.config, Qwen3NextConfig)
         if conv_states is None or recurrent_states is None:
             # GatedDeltaNet internally lifts ragged 2D input to [1, total_seq, hidden],
             # so conv/recurrent states must have batch_dim=1.
@@ -234,20 +250,24 @@ class Qwen3Next(Qwen3):
 
     def input_types(
         self, kv_params: KVCacheParams
-    ) -> tuple[TensorType | object, ...]:
+    ) -> tuple[TensorType | BufferType, ...]:
         """Add linear conv/recurrent state input types for graph I/O."""
         base = super().input_types(kv_params)
         num_linear = len(self._linear_layer_indices)
+        assert isinstance(self.config, Qwen3NextConfig)
         dtype = self.config.dtype or DType.float32
         device = self.devices[0]
         conv_shape = self.config.get_linear_conv_state_shape()
         rec_shape = self.config.get_linear_recurrent_state_shape()
-        state_types = []
+        state_types: list[TensorType | BufferType] = []
+        # Use concrete batch=1 since the model unsqueezes ragged 2D input
+        # to [1, total_seq, hidden] internally. Symbolic "batch_size" would
+        # conflict with the concrete 1 during concat.
         for _ in range(num_linear):
             state_types.append(
                 TensorType(
                     dtype,
-                    shape=["batch_size", conv_shape[0], conv_shape[1]],
+                    shape=[1, conv_shape[0], conv_shape[1]],
                     device=device,
                 )
             )
@@ -255,7 +275,7 @@ class Qwen3Next(Qwen3):
             state_types.append(
                 TensorType(
                     dtype,
-                    shape=["batch_size", rec_shape[0], rec_shape[1], rec_shape[2]],
+                    shape=[1, rec_shape[0], rec_shape[1], rec_shape[2]],
                     device=device,
                 )
             )

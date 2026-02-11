@@ -47,6 +47,7 @@ class Qwen3NextConfig(Qwen3Config):
     full_attention_interval: int = 4
     layer_types: list[str] = field(default_factory=list)
     shared_expert_intermediate_size: int = 512
+    partial_rotary_factor: float = 1.0
 
     # Indices of layers that use full (standard) attention; used for decoder and KV cache.
     full_attention_layer_indices: list[int] = field(default_factory=list)
@@ -132,6 +133,9 @@ class Qwen3NextConfig(Qwen3Config):
         shared_expert_intermediate_size = getattr(
             huggingface_config, "shared_expert_intermediate_size", 512
         )
+        partial_rotary_factor = getattr(
+            huggingface_config, "partial_rotary_factor", 1.0
+        )
 
         # KV params use reduced num_layers (full-attention only)
         kv_cache_config = pipeline_config.model.kv_cache
@@ -197,6 +201,7 @@ class Qwen3NextConfig(Qwen3Config):
             full_attention_interval=full_attention_interval,
             layer_types=layer_types,
             shared_expert_intermediate_size=shared_expert_intermediate_size,
+            partial_rotary_factor=partial_rotary_factor,
             full_attention_layer_indices=full_attention_indices,
             total_num_layers=total_num_layers,
         )
