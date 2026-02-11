@@ -62,8 +62,9 @@ class RMSNormGated(Module):
         """hidden_states: (..., dim), gate: (..., dim). Returns (..., dim)."""
         x = hidden_states.cast(DType.float32)
         device = hidden_states.device or DeviceRef.CPU()
+        # ops.mean has implicit keepdim=True, so result already has shape
+        # (..., 1) — no unsqueeze needed.
         variance = ops.mean(ops.mul(x, x), axis=-1)
-        variance = ops.unsqueeze(variance, -1)
         eps = ops.constant(self.eps, DType.float32, DeviceRef.CPU()).to(device)
         x = ops.mul(x, ops.rsqrt(ops.add(variance, eps)))
         w = self.weight.cast(hidden_states.dtype).to(device)

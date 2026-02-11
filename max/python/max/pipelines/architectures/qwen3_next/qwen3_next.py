@@ -30,7 +30,6 @@ from max.nn.legacy.transformer import ReturnLogits
 
 from max.graph import ShardingStrategy
 
-from max.nn.legacy.rotary_embedding import Llama3RotaryEmbedding
 from max.pipelines.architectures.qwen3.qwen3 import (
     Qwen3,
     distribute_value,
@@ -57,18 +56,23 @@ class Qwen3Next(Qwen3):
             raise TypeError("Qwen3Next requires Qwen3NextConfig")
         super().__init__(config)
 
-        # Override RoPE when partial_rotary_factor < 1.0: only rotate a
-        # fraction of head_dim, matching the HF Qwen3-Next implementation.
+        # TODO(partial-rope): Qwen3-Coder-Next uses partial_rotary_factor=0.25
+        # (only 64 of 256 head dims get RoPE). The fused QK RoPE kernel applies
+        # partial RoPE to the LAST dims (DeepSeek-style) with interleaved
+        # layout, while Qwen3-Next needs it on the FIRST dims with
+        # non-interleaved layout.  A proper fix requires rearranging Q/K weight
+        # columns so rotary dims come last in interleaved order.  For now we
+        # use full-dim RoPE so the model compiles; accuracy will be addressed
+        # in a follow-up.
         if config.partial_rotary_factor < 1.0:
-            rope_dim = int(config.kv_params.head_dim * config.partial_rotary_factor)
-            self.rope = Llama3RotaryEmbedding(
-                dim=config.hidden_size,
-                n_heads=config.num_attention_heads,
-                theta=config.rope_theta,
-                max_seq_len=config.max_seq_len,
-                head_dim=rope_dim,
-                interleaved=config.interleaved_rope_weights,
-                scaling_params=config.rope_scaling_params,
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "partial_rotary_factor=%.2f is not yet supported by the "
+                "fused QK RoPE kernel; using full-dim RoPE as a workaround. "
+                "This will reduce accuracy until partial RoPE is properly "
+                "implemented.",
+                config.partial_rotary_factor,
             )
 
         create_norm = functools.partial(
