@@ -61,12 +61,12 @@ class RMSNormGated(Module):
     ) -> TensorValue:
         """hidden_states: (..., dim), gate: (..., dim). Returns (..., dim)."""
         x = hidden_states.cast(DType.float32)
+        device = hidden_states.device or DeviceRef.CPU()
         variance = ops.mean(ops.mul(x, x), axis=-1)
         variance = ops.unsqueeze(variance, -1)
-        x = ops.mul(x, ops.rsqrt(ops.add(variance, ops.constant(self.eps, DType.float32, DeviceRef.CPU()))))
-        w = self.weight.cast(hidden_states.dtype)
-        if hidden_states.device:
-            w = w.to(hidden_states.device)
+        eps = ops.constant(self.eps, DType.float32, DeviceRef.CPU()).to(device)
+        x = ops.mul(x, ops.rsqrt(ops.add(variance, eps)))
+        w = self.weight.cast(hidden_states.dtype).to(device)
         x = ops.mul(x.cast(hidden_states.dtype), w)
         gate_silu = ops.silu(gate.cast(DType.float32)).cast(hidden_states.dtype)
         return ops.mul(x, gate_silu)
