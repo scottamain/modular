@@ -644,9 +644,379 @@ All models inherit from `PipelineModel` and implement:
 
 ### 5.3 Reuse Strategies
 
-1. **Inheritance** (Mistral3): Extends base model, overrides config extraction
-2. **Composition** (Gemma3 Multimodal): Imports layer components from base Gemma3
-3. **Full re-implementation** (GPT-OSS, InternVL): Implements all layers from scratch using MAX primitives
+When porting a new HuggingFace model, a developer must choose one of three strategies based on how similar the new model is to an existing MAX implementation. The following subsections describe each strategy, when to prefer it, and what is concretely required.
+
+#### 5.3.1 Decision Framework
+
+Use this flowchart to choose a strategy:
+
+```
+Is the new model's text decoder architecturally identical
+to an existing MAX model (same attention, MLP, norms)?
+  |
+  ├── YES ─── Does the new model add a vision tower
+  |           or other modality on top?
+  |             |
+  |             ├── YES ─── Strategy B: Composition
+  |             |           (import layers, write new pipeline)
+  |             |
+  |             └── NO  ─── Strategy A: Inheritance
+  |                         (extend base model, override config)
+  |
+  └── NO  ─── Does the new model share *some* layers
+              (e.g., same norm, same attention pattern)
+              with an existing MAX model?
+                |
+                ├── YES ─── Strategy B: Composition
+                |           (import shared layers, write custom layers)
+                |
+                └── NO  ─── Strategy C: Full Re-implementation
+                            (write all layers from scratch)
+```
+
+Key factors to consider:
+
+| Factor | Favors Inheritance | Favors Composition | Favors Full Re-impl |
+|---|---|---|---|
+| Decoder architecture match | Identical to existing model | Shares some layer types | Unique architecture |
+| Adds vision/multimodal | No | Yes | Yes (novel vision encoder) |
+| Custom attention pattern | No (same as base) | Partially shared | Sinks, novel MoE, etc. |
+| Custom activation functions | No | No | Yes |
+| Config structure | Wraps existing config | Different config + shared layers | Entirely new config |
+| Development effort | Very low (days) | Medium (1-2 weeks) | High (2-4 weeks) |
+| Maintenance burden | Lowest (inherits fixes) | Medium (shared layers get fixes) | Highest (independent) |
+
+#### 5.3.2 Strategy A: Inheritance
+
+**Used by:** Mistral3
+
+**When to use:** The new model's text decoder is architecturally identical to an existing MAX model, but the HuggingFace config wraps it differently (e.g., a multimodal config that nests `text_config`) or the model needs minor behavioral adjustments (custom tokenizer, different default parameters).
+
+**What you inherit:** The entire pipeline model implementation -- graph building, compilation, execution, KV cache management, input preparation, tensor parallelism, and all layer implementations. You write no new neural network code.
+
+**Concrete requirements:**
+
+1. **Config class** -- Extend the base config and override `initialize()` to extract the relevant sub-config:
+
+```python
+# mistral3/model_config.py (52 lines total)
+@dataclass(kw_only=True)
+class Mistral3Config(MistralConfig):
+    @override
+    @classmethod
+    def initialize(cls, pipeline_config: PipelineConfig) -> Self:
+        huggingface_config = pipeline_config.model.huggingface_config
+        # Extract the text_config from the multimodal config
+        return cls.initialize_from_config(
+            pipeline_config, huggingface_config.text_config
+        )
+```
+
+2. **Pipeline model class** -- Extend the base model and override methods that receive the raw HuggingFace config to extract the text sub-config first:
+
+```python
+# mistral3/model.py (84 lines total)
+class Mistral3Model(MistralModel):
+    def __init__(self, ..., huggingface_config, ...):
+        super().__init__(
+            ...,
+            text_huggingface_config=huggingface_config.text_config,
+        )
+
+    @classmethod
+    def get_kv_params(cls, huggingface_config, ...):
+        return super().get_kv_params(huggingface_config.text_config, ...)
+
+    @classmethod
+    def calculate_max_seq_len(cls, pipeline_config, huggingface_config):
+        huggingface_config = getattr(
+            huggingface_config, "text_config", huggingface_config
+        )
+        return super().calculate_max_seq_len(pipeline_config, huggingface_config)
+```
+
+3. **Weight adapter** -- Strip multimodal prefixes so the weights match what the base model expects:
+
+```python
+# mistral3/weight_adapters.py (36 lines total)
+MISTRAL_SAFETENSOR_MAP = {
+    "language_model.model.": "",
+    "language_model.": "",
+}
+```
+
+4. **Tokenizer** (optional) -- Subclass if the model has non-standard tokenizer behavior:
+
+```python
+# mistral3/tokenizer.py
+class Mistral3Tokenizer(TextTokenizer):
+    def __init__(self, pipeline_config):
+        super().__init__(pipeline_config)
+        self._load_and_set_chat_template()  # Custom chat template loading
+```
+
+5. **Architecture registration** -- Reference the new config, model, and tokenizer classes:
+
+```python
+# mistral3/arch.py
+mistral3_arch = SupportedArchitecture(
+    name="Mistral3ForConditionalGeneration_Legacy",
+    pipeline_model=Mistral3Model,
+    config=Mistral3Config,
+    tokenizer=Mistral3Tokenizer,
+    weight_adapters={WeightsFormat.safetensors: convert_safetensor_state_dict},
+    ...
+)
+```
+
+**Total code:** Mistral3 required approximately **220 lines** across 5 files (not counting the text encoder, which is an unrelated bonus component). No new neural network layers were written.
+
+**Advantages:** Automatic benefit from any improvements or bug fixes to the base model. Minimal code to maintain. Fast to implement.
+
+**Limitations:** Cannot modify the decoder architecture. If the new model has even one architectural difference in the text decoder (different norm placement, different attention pattern), inheritance breaks and you must fall back to composition or full re-implementation.
+
+#### 5.3.3 Strategy B: Composition
+
+**Used by:** Gemma3 Multimodal
+
+**When to use:** The new model shares significant layer-level components with an existing MAX model, but the overall pipeline structure is different. Common scenario: adding a vision encoder to an existing text model, or building a model that uses the same attention/norm/MLP layers but assembles them differently.
+
+**What you reuse:** Individual layer classes (`Attention`, `TransformerBlock`, `RMSNorm`, `ScaledWordEmbedding`, etc.) imported from the base model's `layers/` directory. You write a new pipeline model, new graph building, and any new layer types (vision encoder, multimodal projector).
+
+**Concrete requirements:**
+
+1. **Import shared layers** -- Import layer classes directly from the base model's layers package:
+
+```python
+# gemma3multimodal/vision_model/gemma3multimodal.py
+from max.pipelines.architectures.gemma3.layers.attention import Gemma3Attention
+from max.pipelines.architectures.gemma3.layers.rms_norm import Gemma3RMSNorm
+from max.pipelines.architectures.gemma3.layers.scaled_word_embedding import ScaledWordEmbedding
+from max.pipelines.architectures.gemma3.layers.transformer_block import Gemma3TransformerBlock
+```
+
+2. **Build the language model using imported layers** -- Construct the same layer stack as the base model but in your own `Module` class, which gives you control over the forward pass:
+
+```python
+class Gemma3LanguageModel(Module):
+    def __init__(self, config):
+        # Reuse all Gemma3 layer types
+        self.embed_tokens = ScaledWordEmbedding(...)
+        self.norm = Gemma3RMSNorm(...)
+        self.lm_head = ColumnParallelLinear(...)
+        self.layers = LayerList([
+            Gemma3TransformerBlock(
+                attention=Gemma3Attention(...),
+                mlp=MLP(...),
+                input_layernorm=Gemma3RMSNorm(...),
+                post_attention_layernorm=Gemma3RMSNorm(...),
+                pre_feedforward_layernorm=Gemma3RMSNorm(...),
+                post_feedforward_layernorm=Gemma3RMSNorm(...),
+                devices=config.devices,
+            )
+            for i in range(num_layers)
+        ])
+
+    def __call__(self, tokens, image_embeddings, image_token_indices, ...):
+        h = self.embed_tokens(tokens)
+        # NEW: merge vision embeddings (not in base Gemma3)
+        h = merge_multimodal_embeddings(h, image_embeddings, image_token_indices)
+        # REUSED: standard transformer forward pass
+        for layer in self.layers:
+            h = layer(h, kv_collection, ...)
+        return self.lm_head(self.norm(h))
+```
+
+3. **Implement new components** -- Write vision encoder, projector, and any model-specific layers from scratch:
+
+```
+vision_model/
+├── attention.py         # Gemma3VisionAttention (new, for SigLIP encoder)
+├── embedding.py         # Gemma3VisionEmbeddings (new, Conv2d patches)
+├── encoding.py          # Gemma3VisionEncoder + EncoderLayer (new)
+├── gemma3multimodal.py  # Gemma3LanguageModel (reuses layers) + Gemma3VisionModel (new)
+└── projection.py        # Gemma3MultiModalProjector (new, avg pool + norm + linear)
+```
+
+4. **Write a new pipeline model** -- Since the execution flow differs from the base model (two compiled models, vision input handling, image batching), you need a full `PipelineModel` subclass:
+
+```python
+class Gemma3_MultiModalModel(AlwaysSignalBuffersMixin, PipelineModel, KVCacheMixin):
+    def load_model(self):
+        # Build and compile TWO separate graphs
+        self.vision_model = self._build_and_compile_vision_graph(...)
+        self.language_model = self._build_and_compile_language_graph(...)
+
+    def execute(self, inputs):
+        if inputs.has_vision_inputs:
+            image_embeddings = self.vision_model.execute(pixel_values=...)
+        logits = self.language_model.execute(
+            tokens=..., image_embeddings=..., ...
+        )
+        return ModelOutputs(next_token_logits=logits)
+```
+
+5. **Separate weight adapters** -- One for vision weights, one for language weights:
+
+```python
+def convert_safetensor_language_state_dict(state_dict):
+    # Filter: only "language_model.*" weights, strip prefix
+    ...
+
+def convert_safetensor_vision_state_dict(state_dict):
+    # Filter: only "vision_tower.*" and "multi_modal_*" weights, strip prefixes
+    ...
+```
+
+6. **Config class** -- Typically a new dataclass that contains both text and vision sub-configs:
+
+```python
+@dataclass
+class Gemma3ForConditionalGenerationConfig(ArchConfigWithKVCache):
+    text_config: Gemma3TextConfig  # Reuses or mirrors base Gemma3 config
+    vision_config: Gemma3VisionConfig  # New, for vision encoder
+    mm_tokens_per_image: int = 256
+    boi_token_index: int = 0
+    eoi_token_index: int = 0
+    image_token_index: int = 0
+```
+
+**Total code:** Gemma3 Multimodal required approximately **2,500 lines** across 10 files. The language model layers are imported (not re-implemented), but the vision encoder, projector, pipeline model, config, and weight adapters are all new.
+
+**Advantages:** Shared layers benefit from upstream fixes. Reduces the amount of neural network code to write and test. The language model's attention, normalization, and MLP are known-correct from the base model.
+
+**Limitations:** Tight coupling to the base model's layer API. If the base model refactors its layer interfaces, the composed model may break. You also cannot modify the shared layers without affecting the base model.
+
+**Cross-architecture composition** is also possible. Gemma3 Multimodal imports `merge_multimodal_embeddings` from InternVL's `embedding_utils.py`, demonstrating that utility functions can be shared across model families:
+
+```python
+from max.pipelines.architectures.internvl.embedding_utils import merge_multimodal_embeddings
+```
+
+#### 5.3.4 Strategy C: Full Re-implementation
+
+**Used by:** GPT-OSS, InternVL
+
+**When to use:** The model has unique architectural features that don't exist in any current MAX implementation (novel attention mechanisms, custom MoE patterns, unique activation functions), or the model's HuggingFace reference uses custom code in the model repo rather than standard transformers classes.
+
+**What you reuse:** Only the base infrastructure from `max.nn.legacy` (Module, Linear, RMSNorm, etc.) and `max.pipelines.lib` (PipelineModel, KVCacheMixin, etc.). All model-specific layers are written from scratch.
+
+**Concrete requirements:**
+
+1. **Custom layer implementations** -- Write every model-specific layer as a `Module` subclass:
+
+For GPT-OSS (attention with sinks, MoE with custom activation):
+```
+layers/
+├── attention.py          # GptOssAttention: sinks, sliding window, YARN RoPE
+├── moe.py               # GptOssMoE + GptOssMoEGate: custom SwiGLU, biases
+└── transformer_block.py  # GptOssTransformerBlock: attention + MoE + allreduce
+```
+
+For InternVL (vision encoder, Qwen2 decoder, multimodal projector):
+```
+layers/
+└── attention.py          # InternVLMultiheadAttention: QK norm, stacked QKV
+internvl.py               # InternVLDecoderLayer, InternVLLanguageModel,
+                          # InternVisionEmbeddings, InternVisionEncoderLayer,
+                          # InternVLVisionModel, InternVLMLP1
+```
+
+2. **Each custom layer must implement:**
+
+   - `__init__()`: Create all `Weight` objects and sub-modules with correct shapes, dtypes, and devices
+   - `__call__()`: Forward pass using `max.graph.ops` and custom kernels
+   - `Shardable` protocol (if tensor parallelism is needed):
+     - `sharding_strategy` property (getter/setter)
+     - `shard(devices)` method that returns a list of sharded copies
+
+   Example skeleton:
+   ```python
+   class MyCustomAttention(Module, Shardable):
+       def __init__(self, *, num_heads, hidden_size, kv_params, dtype, devices, ...):
+           self.q_proj = Linear(hidden_size, num_heads * head_dim, dtype, devices[0])
+           self.k_proj = Linear(hidden_size, kv_heads * head_dim, dtype, devices[0])
+           self.v_proj = Linear(hidden_size, kv_heads * head_dim, dtype, devices[0])
+           self.o_proj = Linear(num_heads * head_dim, hidden_size, dtype, devices[0])
+           # Any model-specific weights
+           self.custom_weight = Weight("custom", shape=[...], dtype=dtype, device=devices[0])
+
+       def __call__(self, x, kv_collection, **kwargs):
+           wqkv = ops.concat([self.q_proj.weight, self.k_proj.weight, self.v_proj.weight])
+           xq = fused_qkv_ragged_matmul(self.kv_params, x, wqkv, ...)
+           xq = fused_qk_ragged_rope(self.kv_params, xq, ...)
+           attn_out = flash_attention_ragged(self.kv_params, xq, ...,
+               # Pass model-specific params to kernel
+               sink_weights=self.custom_weight,
+           )
+           return self.o_proj(attn_out.reshape([total_seq_len, -1]))
+
+       @property
+       def sharding_strategy(self):
+           return self._sharding_strategy
+
+       @sharding_strategy.setter
+       def sharding_strategy(self, strategy):
+           self.q_proj.sharding_strategy = ShardingStrategy.rowwise(strategy.num_devices)
+           self.k_proj.sharding_strategy = ShardingStrategy.rowwise(strategy.num_devices)
+           self.v_proj.sharding_strategy = ShardingStrategy.rowwise(strategy.num_devices)
+           self.o_proj.sharding_strategy = ShardingStrategy.head_aware_columnwise(...)
+
+       def shard(self, devices):
+           # Create per-device copies with sharded weights
+           ...
+   ```
+
+3. **Full pipeline model** -- Write `load_model()`, `_build_graph()`, `execute()`, `prepare_initial_token_inputs()`, and `prepare_next_token_inputs()` from scratch:
+
+```python
+class GptOssModel(AlwaysSignalBuffersMixin, PipelineModel, KVCacheMixin):
+    def load_model(self):
+        graph = Graph("gpt_oss", ...)
+        # Define all input types
+        tokens_type = TensorType(DType.int64, ["total_seq_len"], device=DeviceRef.GPU())
+        offsets_type = TensorType(DType.uint32, ["batch_plus_1"], device=DeviceRef.GPU())
+        # ... kv cache inputs, signal buffers ...
+
+        # Instantiate and call the model architecture
+        model = GptOss(config)
+        model.load_state_dict(state_dict)
+        logits = model(tokens, offsets, kv_collections, signal_buffers, ...)
+        graph.output(logits)
+
+        self._model = session.load(graph)
+```
+
+4. **Config, weight adapters, and arch registration** -- Same as other strategies, but the config may have many model-specific fields (e.g., GPT-OSS has `num_local_experts`, `num_experts_per_tok`, `swiglu_limit`, `sliding_window`, `layer_types`, `rope_scaling` with YARN-specific params).
+
+5. **For multimodal full re-implementations** (InternVL), also implement:
+   - Custom tokenizer and image processor
+   - Vision encoder with all layers
+   - Multimodal projector
+   - Two-model compilation pipeline
+   - Image batching and memory estimation
+
+**Total code:** GPT-OSS required approximately **2,200 lines** across 10 files. InternVL required approximately **4,000 lines** across 12 files (including the full Qwen2 decoder, vision encoder, custom tokenizer, and image preprocessing).
+
+**Advantages:** Complete control over every aspect of the model. No coupling to other model implementations. Can implement any architectural novelty.
+
+**Limitations:** Highest development and maintenance cost. No automatic benefit from improvements to other models. Every layer must be independently tested for correctness. Weight loading, sharding, and KV cache integration must all be handled manually.
+
+#### 5.3.5 Strategy Comparison Summary
+
+| Dimension | A: Inheritance | B: Composition | C: Full Re-impl |
+|---|---|---|---|
+| Lines of code | ~200 | ~2,500 | ~2,000-4,000 |
+| Files to create | 5 | 8-12 | 8-12 |
+| New layer classes | 0 | Vision layers only | All layers |
+| Decoder code | Inherited | Layer classes imported | Written from scratch |
+| Pipeline model | Inherited | New (two-model for multimodal) | New |
+| Config class | Extends base | New (with sub-configs) | New |
+| Weight adapters | Prefix stripping only | Prefix stripping + filtering | Prefix stripping + transforms |
+| Tensor parallelism | Inherited | Inherited for shared layers | Must implement per-layer |
+| KV cache | Inherited | Inherited (language layers) | Must integrate with kernels |
+| Maintenance | Base model fixes propagate | Shared layer fixes propagate | Independent |
+| Example models | Mistral3 | Gemma3 Multimodal | GPT-OSS, InternVL |
 
 ---
 
